@@ -40,6 +40,10 @@ volatile uint8_t RFM69::TARGETID;     // should match _address
 volatile uint8_t RFM69::PAYLOADLEN;
 volatile uint8_t RFM69::ACK_REQUESTED;
 volatile uint8_t RFM69::ACK_RECEIVED; // should be polled immediately after sending a packet with ACK request
+volatile uint8_t RFM69::SESSION_KEY_INCLUDED;
+volatile uint8_t RFM69::SESSION_KEY_REQUESTED;
+volatile uint8_t RFM69::SESSION_KEY; // set to the session key for a particular transmission
+volatile uint8_t RFM69::INCOMING_SESSION_KEY; // set on an incoming packet and used to decide if receiveDone should be true and data should be processed
 volatile int16_t RFM69::RSSI;          // most accurate RSSI during reception (closest to the reception)
 RFM69* RFM69::selfPointer;
 
@@ -206,7 +210,10 @@ void RFM69::send(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool
   writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART); // avoid RX deadlocks
   uint32_t now = millis();
   while (!canSend() && millis() - now < RF69_CSMA_LIMIT_MS) receiveDone();
-  sendFrame(toAddress, buffer, bufferSize, requestACK, false);
+  if (sessionKeyEnabled())
+    sendWithSession(toAddress, buffer, bufferSize, requestACK);
+  else
+    sendFrame(toAddress, buffer, bufferSize, requestACK, false);
 }
 
 // to increase the chance of getting a packet across, call this function instead of send
@@ -234,6 +241,23 @@ bool RFM69::sendWithRetry(uint8_t toAddress, const void* buffer, uint8_t bufferS
   return false;
 }
 
+void RFM69::sendWithSession(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK, uint8_t retryWaitTime) {
+  // reset session key to blank value to start
+  SESSION_KEY = 0;
+  // start the session by requesting a key. don't request an ACK - ACKs are handled at the whole session level
+  //Serial.println("sendWithSession: Requesting session key.");
+  sendFrame(toAddress, null, 0, false, false, true);
+  receiveBegin();
+  // loop until session key received, or timeout
+  uint32_t sentTime = millis();
+  while (millis() - sentTime < retryWaitTime && SESSION_KEY == 0);
+  if (SESSION_KEY == 0) 
+      return;
+  //Serial.print("sendWithSession: Received key: ");
+  //Serial.println(SESSION_KEY);
+  // finally send the data! request the ACK if needed
+  sendFrame(toAddress, buffer, bufferSize, requestACK, false, false, true);
+}
 // should be polled immediately after sending a packet with ACK request
 bool RFM69::ACKReceived(uint8_t fromNodeID) {
   if (receiveDone())
@@ -253,11 +277,14 @@ void RFM69::sendACK(const void* buffer, uint8_t bufferSize) {
   writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART); // avoid RX deadlocks
   uint32_t now = millis();
   while (!canSend() && millis() - now < RF69_CSMA_LIMIT_MS) receiveDone();
-  sendFrame(sender, buffer, bufferSize, false, true);
+  if (sessionKeyEnabled())
+    sendFrame(sender, buffer, bufferSize, false, true, false, true);
+  else
+    sendFrame(sender, buffer, bufferSize, false, true);
   RSSI = _RSSI; // restore payload RSSI
 }
 
-void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK, bool sendACK)
+void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK, bool sendACK, bool sessionRequested, bool sessionIncluded)
 {
   setMode(RF69_MODE_STANDBY); // turn off receiver to prevent reception while filling fifo
   while ((readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY) == 0x00); // wait for ModeReady
@@ -268,16 +295,28 @@ void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize,
   uint8_t CTLbyte = 0x00;
   if (sendACK)
     CTLbyte = 0x80;
-  else if (requestACK)
+  if (requestACK)
     CTLbyte = 0x40;
-
+  if (sessionRequested){
+    CTLbyte = CTLbyte | 0x10;
+    //Serial.println("Sendframe: Session requested");
+  }
+  if (sessionIncluded){
+    CTLbyte = CTLbyte | 0x20;
+    //Serial.println("Sendframe: Session included");
+  }
   // write to FIFO
   select();
   SPI.transfer(REG_FIFO | 0x80);
-  SPI.transfer(bufferSize + 3);
+  if (sessionIncluded)
+    SPI.transfer(bufferSize + 4);
+  else
+    SPI.transfer(bufferSize + 3);
   SPI.transfer(toAddress);
   SPI.transfer(_address);
   SPI.transfer(CTLbyte);
+  if (sessionIncluded)
+    SPI.transfer(SESSION_KEY);
 
   for (uint8_t i = 0; i < bufferSize; i++)
     SPI.transfer(((uint8_t*) buffer)[i]);
@@ -319,7 +358,45 @@ void RFM69::interruptHandler() {
 
     ACK_RECEIVED = CTLbyte & 0x80; // extract ACK-received flag
     ACK_REQUESTED = CTLbyte & 0x40; // extract ACK-requested flag
-
+    SESSION_KEY_INCLUDED = CTLbyte & 0x20; //extract session key included flag
+    SESSION_KEY_REQUESTED = CTLbyte & 0x10; // extract session key request flag
+    
+    // if a new session key was requested, send it right here in the interrupt to avoid having to handle it in sketch manually, and for greater speed
+    if (sessionKeyEnabled() && SESSION_KEY_REQUESTED && !SESSION_KEY_INCLUDED) {
+      unselect();
+      //Serial.println("SESSION_KEY_REQUESTED && !SESSION_KEY_INCLUDED");
+      setMode(RF69_MODE_STANDBY);
+      // generate and set new random key
+      SESSION_KEY = random(256);
+      // send it!
+      sendFrame(SENDERID, null, 0, false, false, true, true);
+      // don't process any data
+      return;
+    }
+    // if both session key bits are set, the incoming packet has a new session key
+    // set the session key and do not process data
+    if (sessionKeyEnabled() && SESSION_KEY_REQUESTED && SESSION_KEY_INCLUDED) {
+      SESSION_KEY = SPI.transfer(0);
+      unselect();
+      //Serial.println("SESSION_KEY_REQUESTED && SESSION_KEY_INCLUDED");
+      setMode(RF69_MODE_RX);
+      // don't process any data
+      return;
+    }
+    // if a session key is included, make sure it is the key we expect
+    // if the key does not match, do not set DATA and return false
+    if (sessionKeyEnabled() && SESSION_KEY_INCLUDED && !SESSION_KEY_REQUESTED) {
+      INCOMING_SESSION_KEY = SPI.transfer(0);
+      if (INCOMING_SESSION_KEY != SESSION_KEY){
+        unselect();
+        //Serial.println("SESSION_KEY_INCLUDED && !SESSION_KEY_REQUESTED");
+        setMode(RF69_MODE_RX);
+        // don't process any data
+        return;
+      }
+      // if keys do match, actual data is payload - 4 instead of 3 to account for key
+      DATALEN = PAYLOADLEN - 4;
+    }
     for (uint8_t i = 0; i < DATALEN; i++)
     {
       DATA[i] = SPI.transfer(0);
@@ -329,6 +406,7 @@ void RFM69::interruptHandler() {
     setMode(RF69_MODE_RX);
   }
   RSSI = readRSSI();
+  
   //digitalWrite(4, 0);
 }
 
@@ -341,19 +419,27 @@ void RFM69::receiveBegin() {
   PAYLOADLEN = 0;
   ACK_REQUESTED = 0;
   ACK_RECEIVED = 0;
+  SESSION_KEY_INCLUDED = 0;
+  SESSION_KEY_REQUESTED = 0;
   RSSI = 0;
   if (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY)
     writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART); // avoid RX deadlocks
   writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01); // set DIO0 to "PAYLOADREADY" in receive mode
   setMode(RF69_MODE_RX);
 }
-
 bool RFM69::receiveDone() {
 //ATOMIC_BLOCK(ATOMIC_FORCEON)
 //{
   noInterrupts(); // re-enabled in unselect() via setMode() or via receiveBegin()
   if (_mode == RF69_MODE_RX && PAYLOADLEN > 0)
   {
+    // if session key on and keys don't match
+    // return false, as if nothing was even received
+    if (sessionKeyEnabled() && INCOMING_SESSION_KEY != SESSION_KEY) {
+          interrupts(); // explicitly re-enable interrupts
+		  receiveBegin();
+          return false;
+    }
     setMode(RF69_MODE_STANDBY); // enables interrupts
     return true;
   }
@@ -381,6 +467,16 @@ void RFM69::encrypt(const char* key) {
     unselect();
   }
   writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFE) | (key ? 1 : 0));
+}
+
+// Enables session key support for communications
+void RFM69::useSessionKey(bool onOff) {
+  _sessionKeyEnabled = onOff;
+}
+
+// Check if session key support is enabled
+bool RFM69::sessionKeyEnabled() {
+  return _sessionKeyEnabled;
 }
 
 int16_t RFM69::readRSSI(bool forceTrigger) {

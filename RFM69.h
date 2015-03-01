@@ -77,6 +77,10 @@ class RFM69 {
     static volatile uint8_t PAYLOADLEN;
     static volatile uint8_t ACK_REQUESTED;
     static volatile uint8_t ACK_RECEIVED; // should be polled immediately after sending a packet with ACK request
+    static volatile uint8_t SESSION_KEY_INCLUDED;
+    static volatile uint8_t SESSION_KEY_REQUESTED;
+    static volatile uint8_t SESSION_KEY; // set to the session key for a particular transmission
+    static volatile uint8_t INCOMING_SESSION_KEY; // set on an incoming packet and used to decide if receiveDone should be true and data should be processed
     static volatile int16_t RSSI; // most accurate RSSI during reception (closest to the reception)
     static volatile uint8_t _mode; // should be protected?
 
@@ -86,6 +90,7 @@ class RFM69 {
       _interruptNum = interruptNum;
       _mode = RF69_MODE_STANDBY;
       _promiscuousMode = false;
+	  _sessionKeyEnabled = false;
       _powerLevel = 31;
       _isRFM69HW = isRFM69HW;
     }
@@ -103,6 +108,8 @@ class RFM69 {
     uint32_t getFrequency();
     void setFrequency(uint32_t freqHz);
     void encrypt(const char* key);
+	void useSessionKey(bool enabled);
+	bool sessionKeyEnabled();
     void setCS(uint8_t newSPISlaveSelect);
     int16_t readRSSI(bool forceTrigger=false);
     void promiscuous(bool onOff=true);
@@ -120,7 +127,8 @@ class RFM69 {
   protected:
     static void isr0();
     void virtual interruptHandler();
-    void sendFrame(uint8_t toAddress, const void* buffer, uint8_t size, bool requestACK=false, bool sendACK=false);
+    void sendFrame(uint8_t toAddress, const void* buffer, uint8_t size, bool requestACK=false, bool sendACK=false, bool sessionRequested=false, bool sessionIncluded=false);
+	void sendWithSession(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK=false, uint8_t retryWaitTime=40);
 
     static RFM69* selfPointer;
     uint8_t _slaveSelectPin;
@@ -128,6 +136,7 @@ class RFM69 {
     uint8_t _interruptNum;
     uint8_t _address;
     bool _promiscuousMode;
+	bool _sessionKeyEnabled;
     uint8_t _powerLevel;
     bool _isRFM69HW;
     uint8_t _SPCR;
