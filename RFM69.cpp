@@ -267,9 +267,9 @@ void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize,
   // control byte
   uint8_t CTLbyte = 0x00;
   if (sendACK)
-    CTLbyte = 0x80;
+    CTLbyte = RFM69_CTL_SENDACK;
   else if (requestACK)
-    CTLbyte = 0x40;
+    CTLbyte = RFM69_CTL_REQACK;
 
   // write to FIFO
   select();
@@ -317,8 +317,10 @@ void RFM69::interruptHandler() {
     SENDERID = SPI.transfer(0);
     uint8_t CTLbyte = SPI.transfer(0);
 
-    ACK_RECEIVED = CTLbyte & 0x80; // extract ACK-received flag
-    ACK_REQUESTED = CTLbyte & 0x40; // extract ACK-requested flag
+    ACK_RECEIVED = CTLbyte & RFM69_CTL_SENDACK; // extract ACK-received flag
+    ACK_REQUESTED = CTLbyte & RFM69_CTL_REQACK; // extract ACK-requested flag
+    
+    interruptHook(CTLbyte);     // TWS: hook to derived class interrupt function
 
     for (uint8_t i = 0; i < DATALEN; i++)
     {
